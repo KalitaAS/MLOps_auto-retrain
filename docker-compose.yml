@@ -1,15 +1,9 @@
-x-airflow-common: 
-  &airflow-common
+version: '3.8'
+
+x-airflow-common: &airflow-common
   build: .
-  environment: &airflow-common-env
-    AIRFLOW__CORE__EXECUTOR: LocalExecutor
-    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
-    AIRFLOW__CORE__FERNET_KEY: ''
-    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
-    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
-    AIRFLOW__API__AUTH_BACKENDS: 'airflow.api.auth.backend.basic_auth'
-    AIRFLOW_UID: 50000
-    MLFLOW_TRACKING_URI: http://mlflow:5000
+  environment:
+    <<: *airflow-common-env
   volumes:
     - ./dags:/opt/airflow/dags
     - ./logs:/opt/airflow/logs
@@ -17,12 +11,22 @@ x-airflow-common:
     - ./models:/opt/airflow/models
     - ./mlruns:/mlruns
     - ./mlflow.db:/mlflow.db
-  user: "${AIRFLOW_UID:-50000}:0"
+  user: "${AIRFLOW_UID:-50000}:${AIRFLOW_GID:-50000}"
   networks:
     - mlops-network
   depends_on:
     postgres:
       condition: service_healthy
+
+x-airflow-common-env: &airflow-common-env
+  AIRFLOW__CORE__EXECUTOR: LocalExecutor
+  AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+  AIRFLOW__CORE__FERNET_KEY: ''
+  AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+  AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+  AIRFLOW__API__AUTH_BACKENDS: 'airflow.api.auth.backend.basic_auth'
+  AIRFLOW_UID: "${AIRFLOW_UID:-50000}"
+  MLFLOW_TRACKING_URI: http://mlflow:5000
 
 services:
   postgres:
@@ -49,7 +53,7 @@ services:
       - ./mlruns:/mlruns
       - ./mlflow.db:/mlflow.db
     environment:
-      - MLFLOW_TRACKING_URI=http://localhost:5000
+      MLFLOW_TRACKING_URI: http://mlflow:5000  # ← важно: внутри сети Docker используем имя сервиса
     networks:
       - mlops-network
     healthcheck:
@@ -65,10 +69,10 @@ services:
     ports:
       - "5001:5001"
     environment:
-      - B_TRAFFIC_RATIO=0.3
-      - MLFLOW_TRACKING_URI=http://mlflow:5000
-      - SWAGGER_URL=/api/docs
-      - API_URL=/static/swagger.json
+      B_TRAFFIC_RATIO: "0.3"
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      SWAGGER_URL: /api/docs
+      API_URL: /static/swagger.json
     depends_on:
       mlflow:
         condition: service_healthy
@@ -80,23 +84,34 @@ services:
 
   airflow-init:
     <<: *airflow-common
-    command: >
-      bash -c "airflow db init &&
-               airflow users create --username admin --password admin --firstname Admin --lastname User --role Admin --email admin@example.com"
+    entrypoint: >
+      bash -c "
+        until pg_isready -h postgres -U airflow; do
+          echo 'Waiting for PostgreSQL...';
+          sleep 2;
+        done;
+        airflow db init &&
+        airflow users create
+          --username admin
+          --password admin
+          --firstname Admin
+          --lastname User
+          --role Admin
+          --email admin@example.com
+      "
     networks:
       - mlops-network
-    depends_on:
-      postgres:
-        condition: service_healthy
 
   airflow-webserver:
     <<: *airflow-common
     command: webserver
     ports:
-      - 8080:8080
+      - "8080:8080"
     depends_on:
-      - airflow-init
-      - mlflow
+      airflow-init:
+        condition: service_completed_successfully
+      mlflow:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
       interval: 30s
@@ -108,8 +123,10 @@ services:
     <<: *airflow-common
     command: scheduler
     depends_on:
-      - airflow-init
-      - mlflow
+      airflow-init:
+        condition: service_completed_successfully
+      mlflow:
+        condition: service_healthy
     restart: always
 
 volumes:
